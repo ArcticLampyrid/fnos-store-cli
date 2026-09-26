@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fnos-store"
+version = "1.0.0"
+description = "Query the public fnOS store and download verified .fpk packages."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "cryptography>=49",
+  "httpx2>=2.13",
+  "tenacity>=9",
+  "typer>=0.16",
+]
+
+[project.scripts]
+fnos-store = "fnos_store_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src/fnos-store"}
+py-modules = [
+  "fnos_store_cli",
+  "fnos_store_client",
+  "fnos_store_errors",
+  "fnos_store_package",
+  "fnos_store_protocol",
+]

@@ -141,7 +141,7 @@ iv       = key[0:16]
 plain    = AES-256-CFB128-Decrypt(key, iv, cipher)
 ```
 
-`encryptBlock` 按接口返回的文本参与拼接，不能先当作二进制解码。明文从字节 0 开始，是未压缩的 ustar tar。输出 `.fpk` 是这份 tar 的 gzip 包装，gzip 时间戳固定为 0，因此相同输入得到稳定结果。
+`encryptBlock` 按接口返回的文本参与拼接，不能先当作二进制解码。明文从字节 0 开始，是未压缩的 ustar tar。输出 `.fpk` 是这份 tar 的 gzip 包装，gzip 时间戳和原始文件名均不写入，因此相同输入得到稳定结果。
 
 下载在替换输出文件前检查：
 
@@ -149,7 +149,7 @@ plain    = AES-256-CFB128-Decrypt(key, iv, cipher)
 2. `fileSize`；
 3. `checkSum`；
 4. 解密结果的 `ustar` 标记；
-5. tar 是否可读且至少有一个成员。
+5. tar 头和成员边界是否完整；对于商店中缺少标准结束块、但最后一个成员数据完整的历史包，程序会补齐两个 tar 结束块。
 
 任何一步失败都会删除临时文件，不会把不完整内容报告为成功。
 

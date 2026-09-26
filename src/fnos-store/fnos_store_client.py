@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +13,7 @@ import httpx2
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from fnos_store_errors import RetryableResponse, StoreError
-from fnos_store_package import decrypt_stream, derive_key, is_ustar, tar_entries, write_fpk
+from fnos_store_package import decrypt_stream, derive_key, ensure_tar_end, is_ustar, write_fpk
 from fnos_store_protocol import (
     DEFAULT_BASE_URL,
     DEFAULT_LIVEUPDATE_URL,
@@ -123,69 +125,68 @@ class StoreClient:
         except OSError as exc:
             raise StoreError("invalid_params", f"cannot create output directory: {exc}") from exc
 
-        encrypted_path = target.with_name(target.name + ".part")
+        decrypted_path: Path | None = None
         key = derive_key(selected["appName"], selected["version"], encrypt_block)
         digest = hashlib.md5()
         encrypted_size = 0
 
         try:
-            with self.http.stream("GET", link, follow_redirects=False) as response:
-                self._check_download_response(response)
-                content_length = response.headers.get("Content-Length")
-                if content_length and content_length.isdigit() and found.get("file_size") is not None:
-                    if int(content_length) != int(found["file_size"]):
-                        raise StoreError("decrypt_failed", "The downloaded package is incomplete.")
+            try:
+                descriptor, name = tempfile.mkstemp(
+                    prefix=f".{target.name}.",
+                    suffix=".tar.part",
+                    dir=target.parent,
+                )
+                os.close(descriptor)
+                decrypted_path = Path(name)
+                with self.http.stream("GET", link, follow_redirects=False) as response:
+                    self._check_download_response(response)
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and content_length.isdigit() and found.get("file_size") is not None:
+                        if int(content_length) != int(found["file_size"]):
+                            raise StoreError("decrypt_failed", "The downloaded package is incomplete.")
 
-                def encrypted_chunks():
-                    nonlocal encrypted_size
-                    for chunk in response.iter_bytes(65536):
-                        digest.update(chunk)
-                        encrypted_size += len(chunk)
-                        yield chunk
+                    def encrypted_chunks():
+                        nonlocal encrypted_size
+                        for chunk in response.iter_bytes(65536):
+                            digest.update(chunk)
+                            encrypted_size += len(chunk)
+                            yield chunk
 
-                plain_size, prefix = decrypt_stream(encrypted_chunks(), encrypted_path, key)
-        except StoreError:
-            encrypted_path.unlink(missing_ok=True)
-            raise
-        except httpx2.TimeoutException as exc:
-            encrypted_path.unlink(missing_ok=True)
-            raise StoreError("timeout", "The package download timed out.", retryable=True) from exc
-        except httpx2.ConnectError as exc:
-            encrypted_path.unlink(missing_ok=True)
-            if any(word in str(exc).lower() for word in ("certificate", "tls", "ssl")):
-                raise StoreError("tls_error", "TLS certificate verification failed.") from exc
-            raise StoreError("http_error", "The package download could not connect.", retryable=True) from exc
-        except httpx2.RequestError as exc:
-            encrypted_path.unlink(missing_ok=True)
-            raise StoreError("http_error", "The package download failed.", retryable=True) from exc
-        except OSError as exc:
-            encrypted_path.unlink(missing_ok=True)
-            raise StoreError("invalid_params", f"cannot write temporary package: {exc}") from exc
+                    decrypt_stream(encrypted_chunks(), decrypted_path, key)
+            except StoreError:
+                raise
+            except httpx2.TimeoutException as exc:
+                raise StoreError("timeout", "The package download timed out.", retryable=True) from exc
+            except httpx2.ConnectError as exc:
+                if any(word in str(exc).lower() for word in ("certificate", "tls", "ssl")):
+                    raise StoreError("tls_error", "TLS certificate verification failed.") from exc
+                raise StoreError("http_error", "The package download could not connect.", retryable=True) from exc
+            except httpx2.RequestError as exc:
+                raise StoreError("http_error", "The package download failed.", retryable=True) from exc
+            except OSError as exc:
+                raise StoreError("invalid_params", f"cannot write temporary package: {exc}") from exc
 
-        output_written = False
-        try:
-            expected_size = found.get("file_size")
-            if expected_size is not None and encrypted_size != int(expected_size):
-                raise StoreError("decrypt_failed", "The downloaded package is incomplete.")
-            expected_checksum = found.get("checksum")
-            if expected_checksum and digest.hexdigest().lower() != str(expected_checksum).lower():
-                raise StoreError("decrypt_failed", "The downloaded package changed during transfer.")
-            if not is_ustar(prefix):
-                raise StoreError("decrypt_failed", "The downloaded package could not be opened.")
-            tar_entries(encrypted_path)
-            write_fpk(encrypted_path, target)
-            output_written = True
-            tar_entries(target)
-        except StoreError:
-            if output_written or not target_existed:
-                target.unlink(missing_ok=True)
-            raise
-        except OSError as exc:
-            if output_written or not target_existed:
-                target.unlink(missing_ok=True)
-            raise StoreError("invalid_params", f"cannot finalize output: {exc}") from exc
+            try:
+                expected_size = found.get("file_size")
+                if expected_size is not None and encrypted_size != int(expected_size):
+                    raise StoreError("decrypt_failed", "The downloaded package is incomplete.")
+                expected_checksum = found.get("checksum")
+                if expected_checksum and digest.hexdigest().lower() != str(expected_checksum).lower():
+                    raise StoreError("decrypt_failed", "The downloaded package changed during transfer.")
+                with decrypted_path.open("rb") as source:
+                    prefix = source.read(512)
+                if not is_ustar(prefix):
+                    raise StoreError("decrypt_failed", "The downloaded package could not be opened.")
+                ensure_tar_end(decrypted_path)
+                write_fpk(decrypted_path, target)
+            except StoreError:
+                raise
+            except OSError as exc:
+                raise StoreError("invalid_params", f"cannot finalize output: {exc}") from exc
         finally:
-            encrypted_path.unlink(missing_ok=True)
+            if decrypted_path is not None:
+                decrypted_path.unlink(missing_ok=True)
 
         return compact({
             "appName": selected.get("appName"),
